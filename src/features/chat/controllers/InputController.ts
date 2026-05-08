@@ -8,7 +8,7 @@
 import type { Component } from 'obsidian';
 import { Notice } from 'obsidian';
 
-import type { ExitPlanModeDecision } from '../../../core/agent/ObsidianCodeService';
+import type { ExitPlanModeDecision, ObsidianCodeService } from '../../../core/agent/ObsidianCodeService';
 import type { SlashCommandManager } from '../../../core/commands';
 import { isCommandBlocked } from '../../../core/security/BlocklistChecker';
 import { TOOL_BASH } from '../../../core/tools/toolNames';
@@ -45,6 +45,8 @@ const PLAN_MODE_REQUEST_PREFIX =
 /** Dependencies for InputController. */
 export interface InputControllerDeps {
   plugin: ObsidianCodePlugin;
+  /** Per-view agent service (was previously plugin.agentService). */
+  agentService: ObsidianCodeService;
   state: ChatState;
   renderer: MessageRenderer;
   streamController: StreamController;
@@ -313,7 +315,7 @@ export class InputController {
 
     let wasInterrupted = false;
     try {
-      for await (const chunk of plugin.agentService.query(promptToSend, imagesForMessage, state.messages, queryOptions)) {
+      for await (const chunk of this.deps.agentService.query(promptToSend, imagesForMessage, state.messages, queryOptions)) {
         if (state.cancelRequested) {
           wasInterrupted = true;
           break;
@@ -396,7 +398,7 @@ export class InputController {
 
     state.planModeRequested = false;
     this.ensurePlanModeState(true);
-    plugin.agentService.setCurrentPlanFilePath(null);
+    this.deps.agentService.setCurrentPlanFilePath(null);
     this.deps.setPlanModeActive(true);
   }
 
@@ -430,7 +432,7 @@ export class InputController {
 
     if (plugin.settings.permissionMode === 'plan') {
       // Clear any stale plan file path before starting a new plan mode session
-      plugin.agentService.setCurrentPlanFilePath(null);
+      this.deps.agentService.setCurrentPlanFilePath(null);
       // Preserve existing agentInitiated value, default to false (user-initiated) if unknown
       const wasAgentInitiated = state.planModeState?.agentInitiated ?? false;
       this.ensurePlanModeState(wasAgentInitiated);
@@ -597,7 +599,7 @@ ${content}
 
     let wasInterrupted = false;
     try {
-      for await (const chunk of plugin.agentService.query(promptToSend, imagesForMessage, state.messages, queryOptions)) {
+      for await (const chunk of this.deps.agentService.query(promptToSend, imagesForMessage, state.messages, queryOptions)) {
         if (state.cancelRequested) {
           wasInterrupted = true;
           break;
@@ -610,7 +612,7 @@ ${content}
     } finally {
       if (wasInterrupted) {
         await streamController.appendText('\n\n<span class="oc-interrupted">Plan mode interrupted</span>');
-        plugin.agentService.setCurrentPlanFilePath(null);
+        this.deps.agentService.setCurrentPlanFilePath(null);
       }
       streamController.hideThinkingIndicator();
       state.isStreaming = false;
@@ -790,7 +792,7 @@ ${content}
     if (!state.isStreaming) return;
     state.cancelRequested = true;
     this.clearQueuedMessage();
-    plugin.agentService.cancel();
+    this.deps.agentService.cancel();
     streamController.hideThinkingIndicator();
   }
 
@@ -1041,7 +1043,7 @@ ${content}
       // Add approval indicator
       this.addApprovalIndicator('approve');
       // Store approved plan content for system prompt
-      plugin.agentService.setApprovedPlanContent(planContent);
+      this.deps.agentService.setApprovedPlanContent(planContent);
       // Show the plan banner
       const planBanner = this.deps.getPlanBanner();
       if (planBanner) {
@@ -1049,7 +1051,7 @@ ${content}
       }
       // Exit plan mode and restore permission settings
       await this.exitPlanPermissionMode();
-      plugin.agentService.setCurrentPlanFilePath(null);
+      this.deps.agentService.setCurrentPlanFilePath(null);
       // Save conversation to clear pending and set approved
       await conversationController.save();
       // Auto-send implementation prompt (hidden from UI)
@@ -1068,11 +1070,11 @@ ${content}
       }
       // Exit plan mode and restore permission settings
       await this.exitPlanPermissionMode();
-      plugin.agentService.setCurrentPlanFilePath(null);
+      this.deps.agentService.setCurrentPlanFilePath(null);
       // RESET SESSION for fresh context window
-      plugin.agentService.resetSession();
+      this.deps.agentService.resetSession();
       // Store approved plan content AFTER reset (resetSession clears it)
-      plugin.agentService.setApprovedPlanContent(planContent);
+      this.deps.agentService.setApprovedPlanContent(planContent);
       // Ignore any further usage updates from the old stream
       state.ignoreUsageUpdates = true;
       // Clear usage and reset the context meter (fresh session)
@@ -1092,7 +1094,7 @@ ${content}
       // Save conversation to clear pending (new plan will be generated)
       await conversationController.save();
       // Clear plan file path to avoid reusing stale content on revise
-      plugin.agentService.setCurrentPlanFilePath(null);
+      this.deps.agentService.setCurrentPlanFilePath(null);
       // Auto-send feedback as hidden plan mode message (indicator already shows it)
       setTimeout(
         () => this.sendMessageWithPlanMode({ content: result.feedback, hidden: true, images: [] }),
@@ -1102,7 +1104,7 @@ ${content}
     } else {
       // Cancel (Esc) - plan mode stays active, user can continue chatting or revise
       // Only clear the plan file path so a new plan can be generated
-      plugin.agentService.setCurrentPlanFilePath(null);
+      this.deps.agentService.setCurrentPlanFilePath(null);
       // Save conversation to clear pending
       await conversationController.save();
       return { decision: 'cancel' };

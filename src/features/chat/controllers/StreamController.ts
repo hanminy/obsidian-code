@@ -5,6 +5,7 @@
  * state tracking, and thinking indicator display.
  */
 
+import type { ObsidianCodeService } from '../../../core/agent/ObsidianCodeService';
 import { isPlanModeTool, isWriteEditTool, TOOL_AGENT_OUTPUT, TOOL_ASK_USER_QUESTION, TOOL_TASK, TOOL_TODO_WRITE } from '../../../core/tools/toolNames';
 import type { ChatMessage, StreamChunk, SubagentInfo, ToolCallInfo } from '../../../core/types';
 import type ObsidianCodePlugin from '../../../main';
@@ -42,6 +43,8 @@ import type { ChatState } from '../state/ChatState';
 /** Dependencies for StreamController. */
 export interface StreamControllerDeps {
   plugin: ObsidianCodePlugin;
+  /** Per-view agent service (was previously plugin.agentService). */
+  agentService: ObsidianCodeService;
   state: ChatState;
   renderer: MessageRenderer;
   asyncSubagentManager: AsyncSubagentManager;
@@ -152,7 +155,7 @@ export class StreamController {
 
       case 'usage': {
         // Skip usage updates from other sessions or when flagged (during session reset)
-        const currentSessionId = plugin.agentService.getSessionId();
+        const currentSessionId = this.deps.agentService.getSessionId();
         const chunkSessionId = chunk.sessionId ?? null;
         if (
           (chunkSessionId && currentSessionId && chunkSessionId !== currentSessionId) ||
@@ -308,7 +311,7 @@ export class StreamController {
       }
 
       // Get answers from stored map (set by ObsidianCodeService callback)
-      const storedAnswers = plugin.agentService.getAskUserQuestionAnswers(chunk.id);
+      const storedAnswers = this.deps.agentService.getAskUserQuestionAnswers(chunk.id);
       const parsed = existingToolCall ? parseAskUserQuestionInput(existingToolCall.input) : null;
 
       // Use stored answers, or fall back to parsed from input
@@ -348,7 +351,7 @@ export class StreamController {
       const writeEditState = state.writeEditStates.get(chunk.id);
       if (writeEditState && isWriteEditTool(existingToolCall.name)) {
         if (!chunk.isError && !isBlocked) {
-          const diffData = plugin.agentService.getDiffData(chunk.id);
+          const diffData = this.deps.agentService.getDiffData(chunk.id);
           if (diffData) {
             existingToolCall.diffData = diffData;
             updateWriteEditWithDiff(writeEditState, diffData);
@@ -498,7 +501,7 @@ export class StreamController {
           toolCall.status = isBlocked ? 'blocked' : (chunk.isError ? 'error' : 'completed');
           toolCall.result = chunk.content;
           updateSubagentToolResult(subagentState, chunk.id, toolCall);
-          this.deps.plugin.agentService.getDiffData(chunk.id);
+          this.deps.agentService.getDiffData(chunk.id);
         }
         break;
       }

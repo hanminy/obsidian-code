@@ -40,6 +40,15 @@ function createMockPlugin() {
       setSessionId: jest.fn(),
       getSessionId: jest.fn().mockReturnValue(null),
     },
+    mcpService: {
+      // Per-view ObsidianCodeService is constructed inside ObsidianCodeView and
+      // pulls McpServerManager from here, so the manager methods need to exist.
+      getManager: jest.fn().mockReturnValue({
+        loadServers: jest.fn().mockResolvedValue(undefined),
+        getServers: jest.fn().mockReturnValue([]),
+        getServer: jest.fn().mockReturnValue(undefined),
+      }),
+    },
     saveSettings: jest.fn().mockResolvedValue(undefined),
     createConversation: jest.fn().mockResolvedValue({
       id: 'conv-1',

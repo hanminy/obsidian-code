@@ -5,8 +5,10 @@
  * history dropdown UI, and greeting/welcome state.
  */
 
-import { setIcon } from 'obsidian';
+import type { WorkspaceLeaf } from 'obsidian';
+import { Notice, setIcon } from 'obsidian';
 
+import type { ObsidianCodeService } from '../../../core/agent/ObsidianCodeService';
 import type { Conversation } from '../../../core/types';
 import type ObsidianCodePlugin from '../../../main';
 import { type ExternalContextSelector, extractLastTodosFromMessages, type FileContextManager, type ImageContextManager, type McpServerSelector, type TodoPanel } from '../../../ui';
@@ -25,6 +27,8 @@ export interface ConversationCallbacks {
 /** Dependencies for ConversationController. */
 export interface ConversationControllerDeps {
   plugin: ObsidianCodePlugin;
+  /** Per-view agent service (was previously plugin.agentService). */
+  agentService: ObsidianCodeService;
   state: ChatState;
   renderer: MessageRenderer;
   asyncSubagentManager: AsyncSubagentManager;
@@ -54,6 +58,12 @@ export interface ConversationControllerDeps {
   setPlanModeActive: (active: boolean) => void;
   /** Get TodoPanel for remounting after messagesEl.empty(). */
   getTodoPanel: () => TodoPanel | null;
+  /** Returns the conversation id pinned to this leaf (from setState/workspace state), or null. */
+  getInitialConversationId: () => string | null;
+  /** Notifies the host view that this leaf is now bound to the given conversation. */
+  onConversationBound: (id: string | null) => void;
+  /** Finds another open chat leaf bound to the given conversation id (excludes the host view). */
+  findOtherLeafBoundTo: (conversationId: string) => WorkspaceLeaf | null;
 }
 
 /**
@@ -84,13 +94,22 @@ export class ConversationController {
     asyncSubagentManager.orphanAllActive();
     state.asyncSubagentStates.clear();
 
-    // Check for existing empty conversation to reuse
-    const emptyConv = plugin.findEmptyConversation();
+    // Check for existing empty conversation to reuse — but exclude any conversation
+    // already bound to another open chat leaf. Without this, "new conversation" in
+    // panel A could grab the empty conversation that panel B is currently showing.
+    const otherBound = plugin.getBoundConversationIds();
+    const ownBound = this.deps.getInitialConversationId();
+    if (ownBound) otherBound.delete(ownBound);
+    const emptyConv = plugin.findEmptyConversation(otherBound);
     const conversation = emptyConv
       ? await plugin.switchConversation(emptyConv.id) ?? await plugin.createConversation()
       : await plugin.createConversation();
 
     state.currentConversationId = conversation.id;
+    // Always do a full reset for createNew — empty/fresh conv should have no carried session,
+    // approvals, diffs, or plan content.
+    this.deps.agentService.resetSession();
+    this.deps.onConversationBound(conversation.id);
     state.clearMessages();
     state.usage = null;
     state.currentTodos = null;
@@ -130,7 +149,20 @@ export class ConversationController {
   async loadActive(): Promise<void> {
     const { plugin, state, renderer } = this.deps;
 
-    let conversation = plugin.getActiveConversation();
+    // Prefer the conversation bound to this leaf (workspace restore or "open new
+    // panel" command). If the bound conversation has been deleted, create a fresh
+    // one for THIS panel rather than falling through to the plugin-global active
+    // conversation (which could be another panel's bound conv and would silently
+    // co-bind both leaves to the same conversation).
+    const boundId = this.deps.getInitialConversationId();
+    let conversation: Conversation | null = null;
+    if (boundId) {
+      conversation = plugin.getConversationById(boundId);
+    } else {
+      // Legacy entry points (default activateView with no leaf state) keep using
+      // the plugin-global active conversation.
+      conversation = plugin.getActiveConversation();
+    }
     const isNewConversation = !conversation;
 
     if (!conversation) {
@@ -141,7 +173,8 @@ export class ConversationController {
     state.messages = [...conversation.messages];
     state.usage = conversation.usage ?? null;
 
-    plugin.agentService.setSessionId(conversation.sessionId);
+    this.deps.agentService.setSessionId(conversation.sessionId);
+    this.deps.onConversationBound(conversation.id);
 
     // Restore approved plan for this conversation
     if (conversation.approvedPlan) {
@@ -207,6 +240,19 @@ export class ConversationController {
     if (id === state.currentConversationId) return;
     if (state.isStreaming) return;
 
+    // Refuse to co-bind a conversation that another panel is already showing.
+    // Two panels sharing one conversation cause: (a) save races where each
+    // overwrites the other's last message, (b) duplicate session resumes that
+    // confuse Claude's session tracking, (c) divergent in-memory message lists.
+    // Instead, jump focus to the panel that already has it open.
+    const otherLeaf = this.deps.findOtherLeafBoundTo(id);
+    if (otherLeaf) {
+      plugin.app.workspace.revealLeaf(otherLeaf);
+      this.deps.getHistoryDropdown()?.removeClass('visible');
+      new Notice('Already open in another panel — jumped to it.');
+      return;
+    }
+
     await this.save();
 
     asyncSubagentManager.orphanAllActive();
@@ -218,6 +264,8 @@ export class ConversationController {
     state.currentConversationId = conversation.id;
     state.messages = [...conversation.messages];
     state.usage = conversation.usage ?? null;
+    this.deps.agentService.setSessionId(conversation.sessionId);
+    this.deps.onConversationBound(conversation.id);
 
     // Restore approved plan for this conversation
     if (conversation.approvedPlan) {
@@ -283,7 +331,7 @@ export class ConversationController {
     const { plugin, state } = this.deps;
     if (!state.currentConversationId) return;
 
-    const sessionId = plugin.agentService.getSessionId();
+    const sessionId = this.deps.agentService.getSessionId();
     const fileCtx = this.deps.getFileContextManager();
     const currentNote = fileCtx?.getCurrentNotePath() || undefined;
     const externalContextSelector = this.deps.getExternalContextSelector();
@@ -440,6 +488,17 @@ export class ConversationController {
       deleteBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
         if (state.isStreaming) return;
+
+        // Refuse deletion if the conversation is currently bound to another open
+        // panel. Otherwise that panel's later save() would silently no-op (storage
+        // already deleted) and any in-flight stream output would be lost.
+        const otherBound = plugin.getBoundConversationIds();
+        if (state.currentConversationId) otherBound.delete(state.currentConversationId);
+        if (otherBound.has(conv.id)) {
+          new Notice('Cannot delete: this conversation is open in another panel.');
+          return;
+        }
+
         await plugin.deleteConversation(conv.id);
         this.updateHistoryDropdown();
 

@@ -136,6 +136,7 @@ function createMockDeps(): StreamControllerDeps {
       },
       agentService,
     } as any,
+    agentService: agentService as any,
     state,
     renderer: {
       renderContent: jest.fn(),

@@ -5,7 +5,7 @@
  * Manages conversation persistence and environment variable configuration.
  */
 
-import type { Editor, MarkdownView } from 'obsidian';
+import type { Editor, MarkdownView, WorkspaceLeaf } from 'obsidian';
 import { Notice, Plugin } from 'obsidian';
 
 import { ObsidianCodeService } from './core/agent/ObsidianCodeService';
@@ -65,11 +65,23 @@ export default class ObsidianCodePlugin extends Plugin {
       this.activateView();
     });
 
+    this.addRibbonIcon('square-plus', 'Open new Obsidian Code panel', () => {
+      void this.openNewChatPanel();
+    });
+
     this.addCommand({
       id: 'open-view',
       name: 'Open chat view',
       callback: () => {
         this.activateView();
+      },
+    });
+
+    this.addCommand({
+      id: 'open-new-panel',
+      name: 'Open new chat panel (split)',
+      callback: async () => {
+        await this.openNewChatPanel();
       },
     });
 
@@ -153,6 +165,35 @@ export default class ObsidianCodePlugin extends Plugin {
     if (leaf) {
       workspace.revealLeaf(leaf);
     }
+  }
+
+  /**
+   * Opens a NEW chat panel in a split (side-by-side with existing chat panels)
+   * bound to a fresh conversation. Multiple panels can run independently.
+   */
+  async openNewChatPanel(): Promise<WorkspaceLeaf | null> {
+    const conversation = await this.createConversation();
+    const { workspace } = this.app;
+
+    const existing = workspace.getLeavesOfType(VIEW_TYPE_OBSIDIAN_CODE);
+    let leaf: WorkspaceLeaf | null = null;
+
+    if (existing.length > 0) {
+      // Split alongside the most recently used chat leaf so the new panel sits next to it.
+      leaf = workspace.createLeafBySplit(existing[existing.length - 1], 'vertical');
+    } else {
+      leaf = workspace.getRightLeaf(true) ?? workspace.getLeaf('tab');
+    }
+
+    if (!leaf) return null;
+
+    await leaf.setViewState({
+      type: VIEW_TYPE_OBSIDIAN_CODE,
+      active: true,
+      state: { conversationId: conversation.id },
+    });
+    workspace.revealLeaf(leaf);
+    return leaf;
   }
 
   /** Loads settings and conversations from persistent storage. */
@@ -489,9 +530,28 @@ export default class ObsidianCodePlugin extends Plugin {
     return this.conversations.find(c => c.id === id) || null;
   }
 
-  /** Finds an existing empty conversation (no messages). */
-  findEmptyConversation(): Conversation | null {
-    return this.conversations.find(c => c.messages.length === 0) || null;
+  /**
+   * Finds an existing empty conversation (no messages) that is not bound
+   * to any leaf in `excludeIds`. Excluding panel-bound ids avoids hijacking
+   * an empty conversation that another open panel is already using.
+   */
+  findEmptyConversation(excludeIds?: Set<string>): Conversation | null {
+    return (
+      this.conversations.find(
+        (c) => c.messages.length === 0 && !excludeIds?.has(c.id)
+      ) || null
+    );
+  }
+
+  /** Returns the set of conversation IDs currently bound to any open chat leaf. */
+  getBoundConversationIds(): Set<string> {
+    const ids = new Set<string>();
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_OBSIDIAN_CODE)) {
+      const view = leaf.view as ObsidianCodeView;
+      const boundId = view.getBoundConversationId?.();
+      if (boundId) ids.add(boundId);
+    }
+    return ids;
   }
 
   /** Returns conversation metadata list for the history dropdown. */
@@ -508,8 +568,14 @@ export default class ObsidianCodePlugin extends Plugin {
     }));
   }
 
-  /** Returns the active ObsidianCode view from workspace, if open. */
+  /**
+   * Returns the most relevant ObsidianCode view from workspace, if open.
+   * Prefers the currently active chat view; falls back to the first leaf.
+   * Used by single-view APIs like attach-current-note.
+   */
   getView(): ObsidianCodeView | null {
+    const active = this.app.workspace.getActiveViewOfType(ObsidianCodeView);
+    if (active) return active;
     const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_OBSIDIAN_CODE);
     if (leaves.length > 0) {
       return leaves[0].view as ObsidianCodeView;

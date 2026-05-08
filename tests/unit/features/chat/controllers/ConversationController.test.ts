@@ -90,15 +90,17 @@ function createMockDeps(overrides: Partial<ConversationControllerDeps> = {}): Co
       findEmptyConversation: jest.fn().mockReturnValue(null),
       updateConversation: jest.fn().mockResolvedValue(undefined),
       renameConversation: jest.fn().mockResolvedValue(undefined),
-      agentService: {
-        getSessionId: jest.fn().mockReturnValue(null),
-        setSessionId: jest.fn(),
-      },
+      getBoundConversationIds: jest.fn().mockReturnValue(new Set<string>()),
       settings: {
         userName: '',
         enableAutoTitleGeneration: true,
         permissionMode: 'yolo',
       },
+    } as any,
+    agentService: {
+      getSessionId: jest.fn().mockReturnValue(null),
+      setSessionId: jest.fn(),
+      resetSession: jest.fn(),
     } as any,
     state,
     renderer: {
@@ -137,6 +139,9 @@ function createMockDeps(overrides: Partial<ConversationControllerDeps> = {}): Co
     getTodoPanel: () => ({
       remount: jest.fn(),
     }) as any,
+    getInitialConversationId: () => null,
+    onConversationBound: jest.fn(),
+    findOtherLeafBoundTo: jest.fn().mockReturnValue(null),
     ...overrides,
   };
 }

@@ -53,15 +53,17 @@ function createMockDeps(overrides: Partial<InputControllerDeps> = {}): InputCont
   // Store image context manager so tests can access it
   const imageContextManager = createMockImageContextManager();
 
+  const agentService = {
+    query: jest.fn(),
+    cancel: jest.fn(),
+    resetSession: jest.fn(),
+    setSessionId: jest.fn(),
+    getSessionId: jest.fn().mockReturnValue(null),
+    setApprovedPlanContent: jest.fn(),
+    setCurrentPlanFilePath: jest.fn(),
+  };
   return {
     plugin: {
-      agentService: {
-        query: jest.fn(),
-        cancel: jest.fn(),
-        resetSession: jest.fn(),
-        setApprovedPlanContent: jest.fn(),
-        setCurrentPlanFilePath: jest.fn(),
-      },
       saveSettings: jest.fn(),
       settings: {
         slashCommands: [],
@@ -78,6 +80,7 @@ function createMockDeps(overrides: Partial<InputControllerDeps> = {}): InputCont
       updateConversation: jest.fn(),
       getConversationById: jest.fn().mockReturnValue(null),
     } as any,
+    agentService: agentService as any,
     state,
     renderer: {
       addMessage: jest.fn().mockReturnValue({
@@ -328,7 +331,7 @@ describe('InputController - Message Queue', () => {
 
       expect(deps.state.queuedMessage).toBeNull();
       expect(deps.state.cancelRequested).toBe(true);
-      expect(deps.plugin.agentService.cancel).toHaveBeenCalled();
+      expect(deps.agentService.cancel).toHaveBeenCalled();
     });
 
     it('should not cancel if not streaming', () => {
@@ -336,7 +339,7 @@ describe('InputController - Message Queue', () => {
 
       controller.cancelStreaming();
 
-      expect(deps.plugin.agentService.cancel).not.toHaveBeenCalled();
+      expect(deps.agentService.cancel).not.toHaveBeenCalled();
     });
   });
 
@@ -355,7 +358,7 @@ describe('InputController - Message Queue', () => {
       deps.getWelcomeEl = () => welcomeEl;
       deps.getFileContextManager = () => fileContextManager as any;
       deps.state.currentConversationId = 'conv-1';
-      deps.plugin.agentService.query = jest.fn().mockImplementation(() => createMockStream([{ type: 'done' }]));
+      deps.agentService.query = jest.fn().mockImplementation(() => createMockStream([{ type: 'done' }]));
 
       inputEl.value = 'See ![[image.png]]';
 
@@ -370,7 +373,7 @@ describe('InputController - Message Queue', () => {
       expect(imageContextManager.clearImages).toHaveBeenCalled();
       expect(deps.plugin.renameConversation).toHaveBeenCalledWith('conv-1', 'Test Title');
       expect(deps.conversationController.save).toHaveBeenCalledWith(true);
-      expect(deps.plugin.agentService.query).toHaveBeenCalled();
+      expect(deps.agentService.query).toHaveBeenCalled();
       expect(deps.state.isStreaming).toBe(false);
     });
 
@@ -386,7 +389,7 @@ describe('InputController - Message Queue', () => {
       };
 
       deps.getFileContextManager = () => fileContextManager as any;
-      deps.plugin.agentService.query = jest.fn().mockImplementation((prompt: string) => {
+      deps.agentService.query = jest.fn().mockImplementation((prompt: string) => {
         prompts.push(prompt);
         return createMockStream([{ type: 'done' }]);
       });
@@ -409,20 +412,20 @@ describe('InputController - Message Queue', () => {
       deps.getMcpServerSelector = () => ({
         getEnabledServers: () => enabledServers,
       }) as any;
-      deps.plugin.agentService.query = jest.fn().mockImplementation(() => createMockStream([{ type: 'done' }]));
+      deps.agentService.query = jest.fn().mockImplementation(() => createMockStream([{ type: 'done' }]));
 
       inputEl.value = 'hello';
 
       await controller.sendMessage();
 
-      const queryCall = (deps.plugin.agentService.query as jest.Mock).mock.calls[0];
+      const queryCall = (deps.agentService.query as jest.Mock).mock.calls[0];
       const queryOptions = queryCall[3];
       expect(queryOptions.mcpMentions).toBe(mcpMentions);
       expect(queryOptions.enabledMcpServers).toBe(enabledServers);
     });
 
     it('should send hidden message with content override without clearing input', async () => {
-      deps.plugin.agentService.query = jest.fn().mockImplementation(() => createMockStream([{ type: 'done' }]));
+      deps.agentService.query = jest.fn().mockImplementation(() => createMockStream([{ type: 'done' }]));
       inputEl.value = 'draft message';
 
       await controller.sendMessage({ hidden: true, content: 'Auto prompt' });
@@ -436,7 +439,7 @@ describe('InputController - Message Queue', () => {
 
   describe('Plan mode', () => {
     it('clears stale plan file path when starting plan mode in plan permission', async () => {
-      (deps.plugin.agentService.query as jest.Mock).mockReturnValue(
+      (deps.agentService.query as jest.Mock).mockReturnValue(
         createMockStream([{ type: 'done' }])
       );
       deps.plugin.settings.permissionMode = 'plan';
@@ -444,11 +447,11 @@ describe('InputController - Message Queue', () => {
 
       await controller.sendPlanModeMessage();
 
-      expect(deps.plugin.agentService.setCurrentPlanFilePath).toHaveBeenCalledWith(null);
+      expect(deps.agentService.setCurrentPlanFilePath).toHaveBeenCalledWith(null);
     });
 
     it('sends plan mode request prefix without switching permission', async () => {
-      deps.plugin.agentService.query = jest.fn().mockImplementation((prompt: string) => {
+      deps.agentService.query = jest.fn().mockImplementation((prompt: string) => {
         expect(prompt).toContain('User requested plan mode. Call EnterPlanMode before responding.');
         return createMockStream([{ type: 'done' }]);
       });
@@ -487,7 +490,7 @@ describe('InputController - Message Queue', () => {
     });
 
     it('activates plan permission mode after EnterPlanMode is pending', async () => {
-      deps.plugin.agentService.query = jest.fn().mockImplementation(() => createMockStream([{ type: 'done' }]));
+      deps.agentService.query = jest.fn().mockImplementation(() => createMockStream([{ type: 'done' }]));
       deps.plugin.settings.permissionMode = 'normal';
       inputEl.value = 'Original request';
 
@@ -503,7 +506,7 @@ describe('InputController - Message Queue', () => {
     });
 
     it('should send hidden plan mode message without rendering user bubble', async () => {
-      (deps.plugin.agentService.query as jest.Mock).mockReturnValue(
+      (deps.agentService.query as jest.Mock).mockReturnValue(
         createMockStream([{ type: 'done' }])
       );
       deps.plugin.settings.permissionMode = 'plan';
@@ -546,7 +549,7 @@ describe('InputController - Message Queue', () => {
       deps.state.currentConversationId = 'conv-1';
 
       // Mock the agent query to return a text response
-      (deps.plugin.agentService.query as jest.Mock).mockReturnValue(
+      (deps.agentService.query as jest.Mock).mockReturnValue(
         createMockStream([
           { type: 'text', content: 'Hello, how can I help?' },
           { type: 'done' },
@@ -589,7 +592,7 @@ describe('InputController - Message Queue', () => {
       });
       deps.state.currentConversationId = 'conv-1';
 
-      (deps.plugin.agentService.query as jest.Mock).mockReturnValue(
+      (deps.agentService.query as jest.Mock).mockReturnValue(
         createMockStream([{ type: 'done' }])
       );
 
@@ -629,7 +632,7 @@ describe('InputController - Message Queue', () => {
       });
       deps.state.currentConversationId = 'conv-1';
 
-      (deps.plugin.agentService.query as jest.Mock).mockReturnValue(
+      (deps.agentService.query as jest.Mock).mockReturnValue(
         createMockStream([
           { type: 'text', content: 'Response text' },
           { type: 'done' },
@@ -679,7 +682,7 @@ describe('InputController - Message Queue', () => {
       });
       deps.state.currentConversationId = 'conv-1';
 
-      (deps.plugin.agentService.query as jest.Mock).mockReturnValue(
+      (deps.agentService.query as jest.Mock).mockReturnValue(
         createMockStream([
           { type: 'text', content: 'Response' },
           { type: 'done' },
@@ -731,7 +734,7 @@ describe('InputController - Message Queue', () => {
       });
       deps.state.currentConversationId = 'conv-1';
 
-      (deps.plugin.agentService.query as jest.Mock).mockReturnValue(
+      (deps.agentService.query as jest.Mock).mockReturnValue(
         createMockStream([
           { type: 'text', content: 'Response' },
           { type: 'done' },
@@ -782,7 +785,7 @@ describe('InputController - Message Queue', () => {
       deps.state.currentConversationId = 'conv-1';
 
       // Return empty stream - no text content
-      (deps.plugin.agentService.query as jest.Mock).mockReturnValue(
+      (deps.agentService.query as jest.Mock).mockReturnValue(
         createMockStream([{ type: 'done' }])
       );
 
@@ -831,7 +834,7 @@ describe('InputController - Message Queue', () => {
       deps.plugin.settings.enableAutoTitleGeneration = false;
       deps.state.currentConversationId = 'conv-1';
 
-      (deps.plugin.agentService.query as jest.Mock).mockReturnValue(
+      (deps.agentService.query as jest.Mock).mockReturnValue(
         createMockStream([
           { type: 'text', content: 'Response text' },
           { type: 'done' },

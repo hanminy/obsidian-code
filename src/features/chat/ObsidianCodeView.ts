@@ -8,6 +8,7 @@
 import type { WorkspaceLeaf } from 'obsidian';
 import { ItemView, setIcon } from 'obsidian';
 
+import { ObsidianCodeService } from '../../core/agent/ObsidianCodeService';
 import { SlashCommandManager } from '../../core/commands';
 import type { ClaudeModel, ThinkingBudget } from '../../core/types';
 import { DEFAULT_CLAUDE_MODELS, DEFAULT_THINKING_BUDGET, VIEW_TYPE_OBSIDIAN_CODE } from '../../core/types';
@@ -47,6 +48,15 @@ import { ChatState } from './state';
 /** Main sidebar chat view for interacting with Claude. */
 export class ObsidianCodeView extends ItemView {
   private plugin: ObsidianCodePlugin;
+
+  /** Per-view agent service so each panel can stream independently. */
+  public readonly agentService: ObsidianCodeService;
+
+  /** Conversation pinned to this leaf via setState (workspace restore or "open new panel"). */
+  private boundConversationId: string | null = null;
+
+  /** Guard so setState arriving after onOpen triggers a single initial load. */
+  private hasLoadedConversation = false;
 
   // State - public for test access
   public readonly state: ChatState;
@@ -92,6 +102,7 @@ export class ObsidianCodeView extends ItemView {
   constructor(leaf: WorkspaceLeaf, plugin: ObsidianCodePlugin) {
     super(leaf);
     this.plugin = plugin;
+    this.agentService = new ObsidianCodeService(plugin, plugin.mcpService.getManager());
     this.state = new ChatState({
       onUsageChanged: (usage) => this.contextUsageMeter?.update(usage),
       onTodosChanged: (todos) => this.todoPanel?.updateTodos(todos),
@@ -111,6 +122,64 @@ export class ObsidianCodeView extends ItemView {
 
   getIcon(): string {
     return 'bot';
+  }
+
+  /** Returns leaf state that Obsidian persists in workspace.json. */
+  getState(): Record<string, unknown> {
+    const base = super.getState() as Record<string, unknown>;
+    return { ...base, conversationId: this.boundConversationId };
+  }
+
+  /**
+   * Receives leaf state on workspace restore or after `leaf.setViewState({state: {...}})`.
+   *
+   * Obsidian doesn't strictly guarantee order vs onOpen; both code paths must be
+   * idempotent. onOpen also reads leaf state synchronously via
+   * hydrateBoundConversationFromLeaf, so this handler covers two cases:
+   *   1. State arriving before initial load (boundConversationId not yet consulted) —
+   *      record it and the deferred load will use it.
+   *   2. State arriving after initial load with a different id — switch panels.
+   */
+  async setState(state: unknown, result: { history: boolean }): Promise<void> {
+    if (state && typeof state === 'object') {
+      const cid = (state as { conversationId?: unknown }).conversationId;
+      if (typeof cid === 'string' && cid.length > 0) {
+        const previousId = this.boundConversationId;
+        this.boundConversationId = cid;
+        if (this.hasLoadedConversation && previousId !== cid && this.conversationController) {
+          if (cid !== this.state.currentConversationId) {
+            await this.conversationController.switchTo(cid);
+          }
+        } else if (!this.hasLoadedConversation) {
+          // Initial load hasn't run yet; trigger it (idempotent).
+          await this.triggerInitialLoad();
+        }
+      }
+    }
+    return super.setState(state as Record<string, unknown>, result);
+  }
+
+  getBoundConversationId(): string | null {
+    return this.boundConversationId;
+  }
+
+  /** Records this leaf's bound conversation and asks Obsidian to persist the workspace. */
+  bindConversation(id: string | null): void {
+    this.boundConversationId = id;
+    this.app.workspace.requestSaveLayout();
+  }
+
+  /** Returns another open chat leaf bound to the given conversation id, excluding self. */
+  findOtherLeafBoundTo(conversationId: string): WorkspaceLeaf | null {
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_OBSIDIAN_CODE);
+    for (const leaf of leaves) {
+      if (leaf === this.leaf) continue;
+      const view = leaf.view as ObsidianCodeView;
+      if (view?.getBoundConversationId?.() === conversationId) {
+        return leaf;
+      }
+    }
+    return null;
   }
 
   async onOpen() {
@@ -159,8 +228,29 @@ export class ObsidianCodeView extends ItemView {
     // Start selection polling
     this.selectionController?.start();
 
-    // Load conversation
-    await this.conversationController?.loadActive();
+    // Read leaf state synchronously so loadActive sees the bound conversation
+    // immediately. Avoids depending on Obsidian's setState ordering.
+    this.hydrateBoundConversationFromLeaf();
+    void this.triggerInitialLoad();
+  }
+
+  /** Reads the current leaf's persisted state and seeds boundConversationId. */
+  private hydrateBoundConversationFromLeaf(): void {
+    const leafState = this.leaf.getViewState()?.state as
+      | { conversationId?: unknown }
+      | undefined;
+    const cid = leafState?.conversationId;
+    if (typeof cid === 'string' && cid.length > 0) {
+      this.boundConversationId = cid;
+    }
+  }
+
+  /** Idempotent initial conversation load. Safe to call from onOpen and setState. */
+  private async triggerInitialLoad(): Promise<void> {
+    if (this.hasLoadedConversation) return;
+    if (!this.conversationController) return;
+    this.hasLoadedConversation = true;
+    await this.conversationController.loadActive();
   }
 
   async onClose() {
@@ -175,9 +265,16 @@ export class ObsidianCodeView extends ItemView {
     cleanupThinkingBlock(this.state.currentThinkingState);
     this.state.currentThinkingState = null;
 
-    // Cleanup services
-    this.plugin.agentService.setApprovalCallback(null);
-    this.plugin.agentService.setAskUserQuestionCallback(null);
+    // Drop callbacks first so any in-flight stream that tries to fire UI hooks
+    // during teardown does not throw. cleanup() is deferred until AFTER save()
+    // because cleanup() resets sessionId/approvedPlan and save() needs those.
+    this.agentService.setApprovalCallback(null);
+    this.agentService.setAskUserQuestionCallback(null);
+    this.agentService.setEnterPlanModeCallback(null);
+    this.agentService.setExitPlanModeCallback(null);
+
+    // Cancel any in-flight query without resetting session/plan state.
+    this.agentService.cancel();
 
     // Cleanup UI components
     this.fileContextManager?.destroy();
@@ -197,8 +294,10 @@ export class ObsidianCodeView extends ItemView {
     this.asyncSubagentManager.orphanAllActive();
     this.state.asyncSubagentStates.clear();
 
-    // Save conversation
+    // Save conversation while sessionId/approvedPlan are still readable from
+    // agentService. Then fully reset the per-view service.
     await this.conversationController?.save();
+    this.agentService.cleanup();
   }
 
   // ============================================
@@ -408,6 +507,7 @@ export class ObsidianCodeView extends ItemView {
     // Stream controller
     this.streamController = new StreamController({
       plugin: this.plugin,
+      agentService: this.agentService,
       state: this.state,
       renderer: this.renderer!,
       asyncSubagentManager: this.asyncSubagentManager,
@@ -423,6 +523,7 @@ export class ObsidianCodeView extends ItemView {
     this.conversationController = new ConversationController(
       {
         plugin: this.plugin,
+        agentService: this.agentService,
         state: this.state,
         renderer: this.renderer!,
         asyncSubagentManager: this.asyncSubagentManager,
@@ -436,8 +537,8 @@ export class ObsidianCodeView extends ItemView {
         getMcpServerSelector: () => this.mcpServerSelector,
         getExternalContextSelector: () => this.externalContextSelector,
         clearQueuedMessage: () => this.inputController?.clearQueuedMessage(),
-        getApprovedPlan: () => this.plugin.agentService.getApprovedPlanContent(),
-        setApprovedPlan: (plan) => this.plugin.agentService.setApprovedPlanContent(plan),
+        getApprovedPlan: () => this.agentService.getApprovedPlanContent(),
+        setApprovedPlan: (plan) => this.agentService.setApprovedPlanContent(plan),
         showPlanBanner: (content) => { void this.planBanner?.show(content); },
         hidePlanBanner: () => this.planBanner?.hide(),
         triggerPendingPlanApproval: (content) => this.inputController?.restorePendingPlanApproval(content),
@@ -446,6 +547,9 @@ export class ObsidianCodeView extends ItemView {
           this.updatePlanModeUiState();
         },
         getTodoPanel: () => this.todoPanel,
+        getInitialConversationId: () => this.boundConversationId,
+        onConversationBound: (id) => this.bindConversation(id),
+        findOtherLeafBoundTo: (cid) => this.findOtherLeafBoundTo(cid),
       },
       {}
     );
@@ -453,6 +557,7 @@ export class ObsidianCodeView extends ItemView {
     // Input controller
     this.inputController = new InputController({
       plugin: this.plugin,
+      agentService: this.agentService,
       state: this.state,
       renderer: this.renderer!,
       streamController: this.streamController,
@@ -483,22 +588,22 @@ export class ObsidianCodeView extends ItemView {
     });
 
     // Set approval callback
-    this.plugin.agentService.setApprovalCallback(
+    this.agentService.setApprovalCallback(
       (toolName, input, description) => this.inputController!.handleApprovalRequest(toolName, input, description)
     );
 
     // Set AskUserQuestion callback
-    this.plugin.agentService.setAskUserQuestionCallback(
+    this.agentService.setAskUserQuestionCallback(
       (input) => this.inputController!.handleAskUserQuestion(input)
     );
 
     // Set ExitPlanMode callback
-    this.plugin.agentService.setExitPlanModeCallback(
+    this.agentService.setExitPlanModeCallback(
       (planFilePath) => this.inputController!.handleExitPlanMode(planFilePath)
     );
 
     // Set EnterPlanMode callback
-    this.plugin.agentService.setEnterPlanModeCallback(
+    this.agentService.setEnterPlanModeCallback(
       () => this.inputController!.handleEnterPlanMode()
     );
 
